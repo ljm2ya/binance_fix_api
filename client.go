@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/quickfixgo/field"
 	"github.com/quickfixgo/quickfix"
 	"go.uber.org/zap"
+
+	"github.com/ljm2ya/binance_fix_api/handlers"
 )
 
 const logonTimeout = 30 * time.Second
@@ -20,7 +23,9 @@ const logonTimeout = 30 * time.Second
 type Config struct {
 	APIKey             string
 	PrivateKeyFilePath string
+	PrivateKeyPEM      []byte
 	Settings           *quickfix.Settings
+	Endpoint           EndpointType
 }
 
 type Options struct {
@@ -57,8 +62,13 @@ func WithZapLogFactory(logger *zap.SugaredLogger) NewClientOption {
 	}
 }
 
+func WithFixLogFactoryOpt(factory quickfix.LogFactory) NewClientOption {
+	return func(o *Options) {
+		o.fixLogFactory = factory
+	}
+}
+
 type Client struct {
-	l           *zap.SugaredLogger
 	mu          sync.Mutex
 	isConnected atomic.Bool
 	initiator   *quickfix.Initiator
@@ -72,35 +82,46 @@ type Client struct {
 	senderCompID string
 
 	options Options
+	config  Config  // Store original config for reconnection
 }
 
-func NewClient(ctx context.Context, l *zap.SugaredLogger, conf Config, opts ...NewClientOption) (*Client, error) {
-	// Get BeginString, TargetCompID and SenderCompID from settings.
+func NewClient(conf Config, opts ...NewClientOption) (*Client, error) {
+	// Generate settings if not provided
 	if conf.Settings == nil {
-		return nil, errors.New("empty quickfix settings")
+		var err error
+		conf.Settings, err = GenerateQuickFixSettings(conf.Endpoint, conf.APIKey, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	globalSettings := conf.Settings.GlobalSettings()
 	beginString, err := globalSettings.Setting("BeginString")
 	if err != nil {
-		l.Errorw("Failed to read BeginString from settings", "error", err)
 		return nil, err
 	}
 	targetCompID, err := globalSettings.Setting("TargetCompID")
 	if err != nil {
-		l.Errorw("Failed to read TargetCompID from settings", "error", err)
 		return nil, err
 	}
 	senderCompID, err := globalSettings.Setting("SenderCompID")
 	if err != nil {
-		l.Errorw("Failed to read SenderCompID from settings", "error", err)
 		return nil, err
 	}
 
-	privateKey, err := GetEd25519PrivateKeyFromFile(conf.PrivateKeyFilePath)
-	if err != nil {
-		l.Errorw("Failed to GetEd25519PrivateKeyFromFile", "error", err)
-		return nil, err
+	var privateKey ed25519.PrivateKey
+	if conf.PrivateKeyPEM != nil {
+		privateKey, err = ParseEd25519PrivateKey(conf.PrivateKeyPEM)
+		if err != nil {
+			return nil, err
+		}
+	} else if conf.PrivateKeyFilePath != "" {
+		privateKey, err = GetEd25519PrivateKeyFromFile(conf.PrivateKeyFilePath)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, errors.New("either PrivateKeyPEM or PrivateKeyFilePath must be provided")
 	}
 
 	options := defaultOpts()
@@ -110,7 +131,6 @@ func NewClient(ctx context.Context, l *zap.SugaredLogger, conf Config, opts ...N
 
 	// Create a new Client object.
 	client := &Client{
-		l:            l,
 		pending:      make(map[string]*call),
 		emitter:      emission.NewEmitter(),
 		apiKey:       conf.APIKey,
@@ -119,6 +139,7 @@ func NewClient(ctx context.Context, l *zap.SugaredLogger, conf Config, opts ...N
 		targetCompID: targetCompID,
 		senderCompID: senderCompID,
 		options:      options,
+		config:       conf, // Store for reconnection
 	}
 
 	// Init session and logon to Binance FIX API server.
@@ -129,13 +150,6 @@ func NewClient(ctx context.Context, l *zap.SugaredLogger, conf Config, opts ...N
 		options.fixLogFactory,
 	)
 	if err != nil {
-		client.l.Errorw("Failed to create new initiator", "error", err)
-		return nil, err
-	}
-
-	err = client.Start(ctx)
-	if err != nil {
-		client.l.Errorw("Failed to start fix connection", "error", err)
 		return nil, err
 	}
 
@@ -144,7 +158,6 @@ func NewClient(ctx context.Context, l *zap.SugaredLogger, conf Config, opts ...N
 
 func (c *Client) Start(ctx context.Context) error {
 	if err := c.initiator.Start(); err != nil {
-		c.l.Errorw("Failed to initialize initiator", "error", err)
 		return err
 	}
 
@@ -169,6 +182,68 @@ func (c *Client) IsConnected() bool {
 	return c.isConnected.Load()
 }
 
+// SubscribeToDisconnect allows listening for disconnection events
+func (c *Client) SubscribeToDisconnect(callback func(sessionID quickfix.SessionID)) {
+	c.emitter.On("disconnect", func(args ...interface{}) {
+		if len(args) > 0 {
+			if sessionID, ok := args[0].(quickfix.SessionID); ok {
+				callback(sessionID)
+			}
+		}
+	})
+}
+
+// WaitForDisconnect blocks until the connection is lost (useful for long-running tests)
+func (c *Client) WaitForDisconnect() <-chan bool {
+	disconnected := make(chan bool, 1)
+	c.SubscribeToDisconnect(func(_ quickfix.SessionID) {
+		select {
+		case disconnected <- true:
+		default:
+		}
+	})
+	return disconnected
+}
+
+// SubscribeToMaintenance allows listening for server maintenance notifications
+func (c *Client) SubscribeToMaintenance(callback func(headline, text string)) {
+	c.emitter.On("maintenance", func(args ...interface{}) {
+		if len(args) > 0 {
+			if newsData, ok := args[0].(map[string]string); ok {
+				callback(newsData["headline"], newsData["text"])
+			}
+		}
+	})
+}
+
+// SubscribeToReconnectNeeded allows listening for reconnection requirements
+func (c *Client) SubscribeToReconnectNeeded(callback func()) {
+	c.emitter.On("reconnect_needed", func(args ...interface{}) {
+		callback()
+	})
+}
+
+// WaitForMaintenanceOrDisconnect blocks until maintenance is announced or connection is lost
+func (c *Client) WaitForMaintenanceOrDisconnect() <-chan string {
+	events := make(chan string, 1)
+	
+	c.SubscribeToDisconnect(func(_ quickfix.SessionID) {
+		select {
+		case events <- "disconnect":
+		default:
+		}
+	})
+	
+	c.SubscribeToMaintenance(func(headline, text string) {
+		select {
+		case events <- "maintenance":
+		default:
+		}
+	})
+	
+	return events
+}
+
 // Stop closes underlying connection.
 func (c *Client) Stop() {
 	c.initiator.Stop()
@@ -184,6 +259,16 @@ func (c *Client) Call(
 	}
 
 	return call.wait(ctx)
+}
+
+// SendWithoutResponse sends a message without waiting for a response (for subscriptions)
+func (c *Client) SendWithoutResponse(msg *quickfix.Message) error {
+	if !c.isConnected.Load() {
+		return ErrClosed
+	}
+
+	c.addCommonHeaders(msg)
+	return quickfix.Send(msg)
 }
 
 func (c *Client) addCommonHeaders(msg *quickfix.Message) {
@@ -216,11 +301,50 @@ func (c *Client) send(
 
 func (c *Client) handleSubscriptions(msgType string, msg *quickfix.Message) {
 	if enum.MsgType(msgType) == enum.MsgType_EXECUTION_REPORT {
-		order, err := decodeExecutionReport(msg)
+		order, err := handlers.DecodeExecutionReport(msg)
 		if err != nil {
-			c.l.Errorw("Failed to decodeExecutionReport", "err", err, "msg", msg)
 			return
 		}
 		c.emitter.Emit(ExecutionReportTopic, &order)
+	} else if enum.MsgType(msgType) == enum.MsgType_MARKET_DATA_SNAPSHOT_FULL_REFRESH ||
+		enum.MsgType(msgType) == enum.MsgType_MARKET_DATA_INCREMENTAL_REFRESH {
+		trade, err := handlers.DecodeTradeMessage(msg)
+		if err != nil {
+			return
+		}
+		c.emitter.Emit(TradeStreamTopic, &trade)
+	}
+}
+
+// handleNewsMessage processes News <B> messages for server maintenance notifications
+func (c *Client) handleNewsMessage(msg *quickfix.Message) {
+	// Extract news headline (Tag 148)
+	headline := ""
+	if msg.Body.Has(148) {
+		headline, _ = msg.Body.GetString(148)
+	}
+	
+	// Extract news text (Tag 58) 
+	newsText := ""
+	if msg.Body.Has(58) {
+		newsText, _ = msg.Body.GetString(58)
+	}
+	
+	// Check if this is a maintenance notification
+	isMaintenanceNews := strings.Contains(strings.ToLower(headline), "maintenance") || 
+		strings.Contains(strings.ToLower(newsText), "maintenance") ||
+		strings.Contains(strings.ToLower(newsText), "reconnect")
+	
+	if isMaintenanceNews {
+		// Emit maintenance event for applications to handle
+		c.emitter.Emit("maintenance", map[string]string{
+			"headline": headline,
+			"text":     newsText,
+		})
+		
+		// For Market Data connections, trigger reconnection logic
+		if strings.Contains(c.senderCompID, "BMD") {
+			c.emitter.Emit("reconnect_needed", true)
+		}
 	}
 }

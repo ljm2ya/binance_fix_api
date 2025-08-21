@@ -1,63 +1,8 @@
-package fix
+package handlers
 
-import (
-	"github.com/quickfixgo/enum"
-	"github.com/quickfixgo/quickfix"
-	"github.com/quickfixgo/tag"
-)
+import "github.com/quickfixgo/enum"
 
-const (
-	tagMessageHandling quickfix.Tag = 25035
-	tagResponseMode    quickfix.Tag = 25036
-	tagGetLimitReqID   quickfix.Tag = 6136
-
-	tagNoLimitIndicators            quickfix.Tag = 25003
-	tagLimitType                    quickfix.Tag = 25004
-	tagLimitCount                   quickfix.Tag = 25005
-	tagLimitMax                     quickfix.Tag = 25006
-	tagLimitResetInterval           quickfix.Tag = 25007
-	tagLimitResetIntervalResolution quickfix.Tag = 25008
-
-	tagCumQuoteQty       quickfix.Tag = 25017
-	tagOrderCreationTime quickfix.Tag = 25018
-	tagWorkingTime       quickfix.Tag = 25023
-
-	ExecutionReportTopic = "ExecutionReport<8>"
-	TradeStreamTopic     = "TradeStream"
-)
-
-const (
-	msgType_LIMIT_REQUEST  enum.MsgType = "XLQ"
-	msgType_LIMIT_RESPONSE enum.MsgType = "XLR"
-)
-
-var mappedMsgTypeTag = map[enum.MsgType]quickfix.Tag{
-	msgType_LIMIT_RESPONSE:        tagGetLimitReqID,
-	enum.MsgType_EXECUTION_REPORT: tag.ClOrdID,
-}
-
-func getReqIDTagFromMsgType(msgType enum.MsgType) (quickfix.Tag, error) {
-	if tag, ok := mappedMsgTypeTag[msgType]; ok {
-		return tag, nil
-	}
-
-	return 0, ErrInvalidRequestIDTag
-}
-
-type MessageHandling int
-
-const (
-	MessageHandlingUnordered  MessageHandling = 1
-	MessageHandlingSequential MessageHandling = 2
-)
-
-type ResponseMode int
-
-const (
-	ResponseModeEverything ResponseMode = 1
-	ResponseModeOnlyAcks   ResponseMode = 2
-)
-
+// Order status types
 type OrderStatus string
 
 const (
@@ -82,6 +27,7 @@ var mappedOrderStatus = map[enum.OrdStatus]OrderStatus{
 	enum.OrdStatus_EXPIRED:          OrderStatusExpired,
 }
 
+// Time in force types
 type TimeInForce string
 
 const (
@@ -96,6 +42,7 @@ var mappedTimeInForce = map[enum.TimeInForce]TimeInForce{
 	enum.TimeInForce_FILL_OR_KILL:        TimeInForceFOK,
 }
 
+// Order type types
 type OrderType string
 
 const (
@@ -112,6 +59,7 @@ var mappedOrderType = map[enum.OrdType]OrderType{
 	enum.OrdType_STOP_LIMIT: OrderTypeStopLimit,
 }
 
+// Side types
 type SideType string
 
 const (

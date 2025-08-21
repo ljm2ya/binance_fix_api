@@ -1,4 +1,4 @@
-module github.com/KyberNetwork/binance_fix_api
+module github.com/ljm2ya/binance_fix_api
 
 go 1.22
 

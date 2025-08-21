@@ -9,6 +9,8 @@ import (
 	"github.com/quickfixgo/quickfix"
 	"github.com/quickfixgo/tag"
 	"go.uber.org/zap"
+	
+	"github.com/ljm2ya/binance_fix_api/handlers"
 )
 
 /*
@@ -88,10 +90,10 @@ func (s *NewOrderSingleService) Price(price float64) *NewOrderSingleService {
 	return s
 }
 
-func (s *NewOrderSingleService) Do(ctx context.Context) (Order, error) {
+func (s *NewOrderSingleService) Do(ctx context.Context) (handlers.Order, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return Order{}, err
+		return handlers.Order{}, err
 	}
 
 	msg := quickfix.NewMessage()
@@ -114,13 +116,13 @@ func (s *NewOrderSingleService) Do(ctx context.Context) (Order, error) {
 	resp, err := s.c.Call(ctx, id.String(), msg)
 	if err != nil {
 		zap.S().Errorw("Failed to create new order", "request", msg, "err", err)
-		return Order{}, err
+		return handlers.Order{}, err
 	}
 
-	order, err := decodeExecutionReport(resp)
+	order, err := handlers.DecodeExecutionReport(resp)
 	if err != nil {
 		zap.S().Errorw("Failed to decode ExecutionReport message", "request", msg, "response", resp, "error", err)
-		return Order{}, err
+		return handlers.Order{}, err
 	}
 
 	return order, nil

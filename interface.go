@@ -1,6 +1,8 @@
 package fix
 
 import (
+	"strings"
+	
 	"github.com/quickfixgo/enum"
 	"github.com/quickfixgo/field"
 	"github.com/quickfixgo/quickfix"
@@ -15,22 +17,24 @@ func (c *Client) OnCreate(quickfix.SessionID) {}
 // OnLogon notification of a session successfully logging on.
 func (c *Client) OnLogon(quickfix.SessionID) {
 	c.isConnected.Store(true)
-	c.l.Info("Logon successfully!")
 }
 
 // OnLogout notification of a session logging off or disconnecting.
-func (c *Client) OnLogout(quickfix.SessionID) {
-	defer func() {
-		if err := recover(); err != nil {
-			c.l.Errorw("Recover from panic", "error", err)
-		}
-	}()
-
+func (c *Client) OnLogout(sessionID quickfix.SessionID) {
 	c.isConnected.Store(false)
-	c.l.Info("Logged out!")
+	
+	// Clear pending calls
+	c.mu.Lock()
 	for _, call := range c.pending {
 		call.done <- ErrClosed
 		close(call.done)
+	}
+	c.pending = make(map[string]*call) // Reset pending map
+	c.mu.Unlock()
+	
+	// For Market Data connections, emit disconnection event
+	if strings.Contains(c.senderCompID, "BMD") {
+		c.emitter.Emit("disconnect", sessionID)
 	}
 }
 
@@ -38,11 +42,11 @@ func (c *Client) OnLogout(quickfix.SessionID) {
 func (c *Client) ToAdmin(msg *quickfix.Message, _ quickfix.SessionID) {
 	msgType, err := msg.MsgType()
 	if err != nil {
-		c.l.Errorw("Failed to get msg type", "err", err)
+		// Errorw("Failed to get msg type", "err", err)
 		return
 	}
 
-	c.l.Infow("ToAdmin message type", "data", msgType)
+	// Infow("ToAdmin message type", "data", msgType)
 	if enum.MsgType(msgType) == enum.MsgType_LOGON {
 		rawData := GetLogonRawData(c.privateKey, c.senderCompID, c.targetCompID, SendingTimeNow())
 		msg.Body.Set(field.NewRawDataLength(len(rawData)))
@@ -50,19 +54,23 @@ func (c *Client) ToAdmin(msg *quickfix.Message, _ quickfix.SessionID) {
 		msg.Body.Set(field.NewUsername(c.apiKey))
 		msg.Body.Set(field.NewResetSeqNumFlag(true))
 		msg.Body.SetInt(tagMessageHandling, int(c.options.messageHandling))
-		msg.Body.SetInt(tagResponseMode, int(c.options.responseMode))
+		
+		// Only set ResponseMode for Order Entry endpoint (not for Market Data)
+		if c.senderCompID == "BOETRADE" || !strings.Contains(c.senderCompID, "BMD") {
+			msg.Body.SetInt(tagResponseMode, int(c.options.responseMode))
+		}
 	}
 }
 
 // ToApp notification of app message being sent to target.
 func (c *Client) ToApp(msg *quickfix.Message, _ quickfix.SessionID) error {
-	c.l.Infow("Sending message to server", "msg", msg)
+	// Infow("Sending message to server", "msg", msg)
 	return nil
 }
 
 // FromAdmin notification of admin message being received from target.
 func (c *Client) FromAdmin(msg *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
-	c.l.Infow("FromAdmin message", "msg", msg)
+	// Infow("FromAdmin message", "msg", msg)
 	return nil
 }
 
@@ -71,21 +79,27 @@ func (c *Client) FromApp(msg *quickfix.Message, s quickfix.SessionID) quickfix.M
 	// Process message according to message type.
 	msgType, err := msg.MsgType()
 	if err != nil {
-		c.l.Errorw("Failed to get response message type", "error", err)
+		// Errorw("Failed to get response message type", "error", err)
 		return err
+	}
+
+	// Handle News messages for server maintenance
+	if enum.MsgType(msgType) == enum.MsgType_NEWS {
+		c.handleNewsMessage(msg)
+		return nil // News messages don't require response handling
 	}
 
 	c.handleSubscriptions(msgType, msg)
 
 	reqIDTag, err2 := getReqIDTagFromMsgType(enum.MsgType(msgType))
 	if err2 != nil {
-		c.l.Warnw("Could not get request ID tag", "msgType", msgType, "error", err2)
+		// Warnw("Could not get request ID tag", "msgType", msgType, "error", err2)
 		return nil
 	}
 
 	id, err := msg.Body.GetString(reqIDTag)
 	if err != nil {
-		c.l.Errorw("Failed to get request ID", "tag", reqIDTag, "error", err)
+		// Errorw("Failed to get request ID", "tag", reqIDTag, "error", err)
 		return err
 	}
 
@@ -95,16 +109,10 @@ func (c *Client) FromApp(msg *quickfix.Message, s quickfix.SessionID) quickfix.M
 	c.mu.Unlock()
 
 	if call != nil {
-		c.l.Infow(
-			"Matching response message",
-			"id_tag", reqIDTag,
-			"id", id,
-			"request", call.request,
-			"response", msg,
-		)
+		// Matching response message
 		response, err2 := copyMessage(msg)
 		if err2 != nil {
-			c.l.Fatalw("Failed to copy response message", "error", err2)
+			return quickfix.UnsupportedMessageType()
 		}
 		call.response = response
 		call.done <- nil
