@@ -34,6 +34,7 @@ type Options struct {
 	fixLogFactory   quickfix.LogFactory
 }
 
+
 func defaultOpts() Options {
 	return Options{
 		messageHandling: MessageHandlingSequential,
@@ -87,9 +88,10 @@ type Client struct {
 
 func NewClient(conf Config, opts ...NewClientOption) (*Client, error) {
 	// Generate settings if not provided
+	var generatedSenderCompID string
 	if conf.Settings == nil {
 		var err error
-		conf.Settings, err = GenerateQuickFixSettings(conf.Endpoint, conf.APIKey, true)
+		conf.Settings, generatedSenderCompID, err = GenerateQuickFixSettings(conf.Endpoint, conf.APIKey, true)
 		if err != nil {
 			return nil, err
 		}
@@ -107,6 +109,11 @@ func NewClient(conf Config, opts ...NewClientOption) (*Client, error) {
 	senderCompID, err := globalSettings.Setting("SenderCompID")
 	if err != nil {
 		return nil, err
+	}
+	
+	// Use generated SenderCompID if we created the settings
+	if generatedSenderCompID != "" {
+		senderCompID = generatedSenderCompID
 	}
 
 	var privateKey ed25519.PrivateKey
@@ -248,6 +255,7 @@ func (c *Client) WaitForMaintenanceOrDisconnect() <-chan string {
 func (c *Client) Stop() {
 	c.initiator.Stop()
 }
+
 
 // Call initiates a FIX call and wait for the response.
 func (c *Client) Call(

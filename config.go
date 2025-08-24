@@ -3,6 +3,7 @@ package fix
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/quickfixgo/quickfix"
 )
@@ -46,11 +47,27 @@ var DefaultEndpoints = map[EndpointType]EndpointConfig{
 }
 
 // GenerateQuickFixSettings creates QuickFIX settings from endpoint config
-func GenerateQuickFixSettings(endpoint EndpointType, apiKey string, enableSSL bool) (*quickfix.Settings, error) {
+// Returns settings and the generated unique SenderCompID
+func GenerateQuickFixSettings(endpoint EndpointType, apiKey string, enableSSL bool) (*quickfix.Settings, string, error) {
 	config, exists := DefaultEndpoints[endpoint]
 	if !exists {
-		return nil, fmt.Errorf("unknown endpoint type: %s", endpoint)
+		return nil, "", fmt.Errorf("unknown endpoint type: %s", endpoint)
 	}
+
+	// Generate unique SenderCompID to avoid duplicate session ID on reconnection
+	// Must match regex: ^[a-zA-Z0-9-_]{1,8}$
+	// Use last 4 digits of timestamp to keep it short
+	timestamp := time.Now().UnixNano() / 1e6 // milliseconds
+	shortTimestamp := timestamp % 10000 // Last 4 digits
+	
+	// For MD endpoint, use "BMD" prefix (3 chars) + 4 digits = 7 chars total
+	// For OE endpoint, use "BOE" prefix (3 chars) + 4 digits = 7 chars total
+	prefix := "BMD"
+	if endpoint == OrderEntryEndpoint {
+		prefix = "BOE"
+	}
+	
+	uniqueSenderCompID := fmt.Sprintf("%s%04d", prefix, shortTimestamp)
 
 	// Build settings string
 	var settingsBuilder strings.Builder
@@ -61,7 +78,7 @@ func GenerateQuickFixSettings(endpoint EndpointType, apiKey string, enableSSL bo
 	settingsBuilder.WriteString(fmt.Sprintf("SocketConnectHost=%s\n", config.Host))
 	settingsBuilder.WriteString(fmt.Sprintf("SocketConnectPort=%d\n", config.Port))
 	settingsBuilder.WriteString(fmt.Sprintf("HeartBtInt=%d\n", config.HeartbeatInt))
-	settingsBuilder.WriteString(fmt.Sprintf("SenderCompID=%s\n", config.SenderCompID))
+	settingsBuilder.WriteString(fmt.Sprintf("SenderCompID=%s\n", uniqueSenderCompID))
 	settingsBuilder.WriteString(fmt.Sprintf("TargetCompID=%s\n", config.TargetCompID))
 	settingsBuilder.WriteString("ConnectionType=initiator\n")
 	//settingsBuilder.WriteString("ReconnectInterval=5\n")
@@ -90,10 +107,10 @@ func GenerateQuickFixSettings(endpoint EndpointType, apiKey string, enableSSL bo
 	// Create settings from string
 	settings, err := quickfix.ParseSettings(strings.NewReader(settingsBuilder.String()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse settings: %w", err)
+		return nil, "", fmt.Errorf("failed to parse settings: %w", err)
 	}
 
-	return settings, nil
+	return settings, uniqueSenderCompID, nil
 }
 
 // ConnectionConfig holds configuration for a FIX connection
